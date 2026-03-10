@@ -1,43 +1,28 @@
-# watcher.py
+import streamlit as st
+import threading
 import time
 import datetime as dt
-import logging
-from math import isnan
 import yfinance as yf
 import pandas as pd
 import requests
-from apscheduler.schedulers.background import BackgroundScheduler
-from config import (
-    TICKERS,
-    THRESHOLD_PE_LE_25,
-    THRESHOLD_PE_GT_25_OR_NEG,
-    CHECK_INTERVAL_MINUTES,
-    ENABLE_EMAIL,
-    EMAIL_SMTP_SERVER,
-    EMAIL_SMTP_PORT,
-    EMAIL_USERNAME,
-    EMAIL_PASSWORD,
-    EMAIL_FROM,
-    EMAIL_TO,
-    ENABLE_WEBHOOK,
-    WEBHOOK_URL,
-)
+from math import isnan
 
-import smtplib
-from email.mime.text import MIMEText
+# --- CONFIG default ---
+DEFAULT_TICKERS = "AAPL,MSFT,TSLA,AMZN"
+CHECK_INTERVAL_SECONDS = 15 * 60  # 15 minutes
+THRESHOLD_PE_LE_25 = 5.0
+THRESHOLD_PE_GT_25_OR_NEG = 7.5
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+# --- helper functions ---
+def parse_tickers(text):
+    return [t.strip().upper() for t in text.split(",") if t.strip()]
 
 def get_ticker_info(ticker):
-    """Return current_price (float) and trailingPE (float or None)."""
     tk = yf.Ticker(ticker)
-    # fast current price
     info = tk.info
     current_price = info.get("regularMarketPrice") or info.get("previousClose")
     pe = info.get("trailingPE")
-    # If yfinance returns nan, convert to None
     if current_price is None:
-        # fallback to history
         hist = tk.history(period="2d", interval="1d")
         if not hist.empty:
             current_price = float(hist["Close"].iloc[-1])
@@ -46,95 +31,147 @@ def get_ticker_info(ticker):
     return float(current_price), pe
 
 def get_price_7_days_ago(ticker):
-    """Return close price approximately 7 calendar days ago (or the nearest prior trading day)."""
     tk = yf.Ticker(ticker)
     end = dt.datetime.utcnow().date()
-    start = end - dt.timedelta(days=10)  # a window to capture last trading day ~7 days ago
+    start = end - dt.timedelta(days=10)
     hist = tk.history(start=start.isoformat(), end=(end + dt.timedelta(days=1)).isoformat(), interval="1d")
     if hist.empty:
         return None
-    # target date = today - 7 days
     target = end - dt.timedelta(days=7)
-    # find the latest available date on or before target
     dates = pd.to_datetime(hist.index.date)
     past_dates = [d for d in dates if d <= target]
-    if not past_dates:
-        # fallback to earliest available in window
-        chosen = dates[0]
-    else:
-        chosen = max(past_dates)
+    chosen = max(past_dates) if past_dates else dates[0]
     price = float(hist.loc[str(chosen)]["Close"])
     return price
 
-def send_email(subject, body):
-    if not ENABLE_EMAIL:
-        return
-    msg = MIMEText(body)
-    msg["Subject"] = subject
-    msg["From"] = EMAIL_FROM
-    msg["To"] = ", ".join(EMAIL_TO)
-    with smtplib.SMTP(EMAIL_SMTP_SERVER, EMAIL_SMTP_PORT) as s:
-        s.starttls()
-        s.login(EMAIL_USERNAME, EMAIL_PASSWORD)
-        s.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
-
-def send_webhook(payload):
-    if not ENABLE_WEBHOOK:
-        return
-    try:
-        requests.post(WEBHOOK_URL, json=payload, timeout=10)
-    except Exception as e:
-        logging.exception("Webhook notification failed: %s", e)
-
-def check_ticker(ticker):
+def evaluate_ticker(ticker):
     try:
         current_price, pe = get_ticker_info(ticker)
     except Exception as e:
-        logging.exception("Failed to get current price/PE for %s: %s", ticker, e)
-        return
-
+        return {"ticker": ticker, "error": f"current price/PE failed: {e}"}
     prior_price = get_price_7_days_ago(ticker)
     if prior_price is None:
-        logging.warning("%s: could not obtain prior price", ticker)
-        return
-
+        return {"ticker": ticker, "error": "no prior price found"}
     drop_pct = (prior_price - current_price) / prior_price * 100.0
-
-    # Determine threshold
     if (pe is not None) and (pe <= 25):
         threshold = THRESHOLD_PE_LE_25
-        pe_category = f"PE={pe:.2f}"
     else:
         threshold = THRESHOLD_PE_GT_25_OR_NEG
-        pe_category = f"PE={'None' if pe is None else f'{pe:.2f}'}"
+    alert = drop_pct >= threshold
+    return {
+        "ticker": ticker,
+        "prior_price": prior_price,
+        "current_price": current_price,
+        "drop_pct": drop_pct,
+        "pe": pe,
+        "threshold": threshold,
+        "alert": alert,
+        "time": dt.datetime.utcnow().isoformat() + "Z",
+    }
 
-    if drop_pct >= threshold:
-        msg = (
-            f"{ticker} ALERT: price down {drop_pct:.2f}% vs 7 days ago "
-            f"(prior={prior_price:.2f}, now={current_price:.2f}), {pe_category}, threshold={threshold}%"
-        )
-        logging.info(msg)
-        # notifications
-        send_email(f"{ticker} price drop alert", msg)
-        send_webhook({"ticker": ticker, "message": msg, "drop_pct": drop_pct, "pe": pe})
-    else:
-        logging.info("%s: no alert (drop %.2f%%, threshold %s%%, %s)", ticker, drop_pct, threshold, pe_category)
+# --- background worker ---
+def worker_loop(get_tickers_fn, interval_seconds):
+    while True:
+        if not st.session_state.get("running", False):
+            time.sleep(1)
+            continue
+        tickers = get_tickers_fn()
+        now = dt.datetime.utcnow()
+        results = []
+        for t in tickers:
+            res = evaluate_ticker(t)
+            results.append(res)
+        # append to alerts/history
+        history = st.session_state.get("history", [])
+        history.insert(0, {"time": now.isoformat() + "Z", "results": results})
+        st.session_state["history"] = history[:200]  # cap length
+        st.session_state["last_run"] = now.isoformat() + "Z"
+        # sleep interval but check running flag every second so stop is responsive
+        slept = 0
+        while slept < interval_seconds:
+            if not st.session_state.get("running", False):
+                break
+            time.sleep(1)
+            slept += 1
 
-def run_check_all():
-    logging.info("Running check for %d tickers", len(TICKERS))
-    for t in TICKERS:
-        check_ticker(t)
+# --- Streamlit UI ---
+if "running" not in st.session_state:
+    st.session_state["running"] = False
+if "history" not in st.session_state:
+    st.session_state["history"] = []
+if "last_run" not in st.session_state:
+    st.session_state["last_run"] = None
 
-def main():
-    scheduler = BackgroundScheduler()
-    scheduler.add_job(run_check_all, "interval", minutes=CHECK_INTERVAL_MINUTES, next_run_time=dt.datetime.now())
-    scheduler.start()
-    logging.info("Started scheduler: checking every %d minutes", CHECK_INTERVAL_MINUTES)
-    try:
-        while True:
-            time.sleep(60)
-    except (KeyboardInterrupt, SystemExit):
-        scheduler.shutdown()
+st.title("Stock 7-Day Drop Monitor")
 
-if __name__ == "__main__":
-    main()
+col1, col2 = st.columns([2,1])
+with col1:
+    tickers_text = st.text_input("Tickers (comma separated)", value=DEFAULT_TICKERS, key="tickers_text")
+with col2:
+    st.write("Controls")
+    if st.button("Start"):
+        st.session_state["running"] = True
+    if st.button("Stop"):
+        st.session_state["running"] = False
+    if st.button("Run now"):
+        # trigger immediate one-off run by toggling a short-run flag
+        tickers_now = parse_tickers(st.session_state["tickers_text"])
+        results = []
+        for t in tickers_now:
+            results.append(evaluate_ticker(t))
+        now = dt.datetime.utcnow()
+        history = st.session_state.get("history", [])
+        history.insert(0, {"time": now.isoformat() + "Z", "results": results})
+        st.session_state["history"] = history[:200]
+        st.session_state["last_run"] = now.isoformat() + "Z"
+
+st.write(f"Running: {st.session_state['running']}  —  Last run (UTC): {st.session_state['last_run']}")
+
+# start background thread (one only)
+if "worker_thread_started" not in st.session_state:
+    def get_tickers():
+        return parse_tickers(st.session_state["tickers_text"])
+    t = threading.Thread(target=worker_loop, args=(get_tickers, CHECK_INTERVAL_SECONDS), daemon=True)
+    t.start()
+    st.session_state["worker_thread_started"] = True
+
+# show most recent results
+if st.session_state["history"]:
+    latest = st.session_state["history"][0]
+    st.subheader(f"Latest run: {latest['time']}")
+    df_rows = []
+    alerts = []
+    for r in latest["results"]:
+        if "error" in r:
+            df_rows.append([r["ticker"], "-", "-", "-", "-", "-", r["error"]])
+            continue
+        df_rows.append([
+            r["ticker"],
+            f"{r['prior_price']:.2f}",
+            f"{r['current_price']:.2f}",
+            f"{r['drop_pct']:.2f}%",
+            f"{r['pe']:.2f}" if r["pe"] is not None else "None",
+            f"{r['threshold']:.2f}%",
+            "ALERT" if r["alert"] else ""
+        ])
+        if r["alert"]:
+            alerts.append(f"{r['ticker']}: down {r['drop_pct']:.2f}% (threshold {r['threshold']}%)")
+    st.table(pd.DataFrame(df_rows, columns=["Ticker","7d Price","Now","Drop","PE","Thresh","Alert"]))
+    if alerts:
+        st.error("Alerts:\n" + "\n".join(alerts))
+else:
+    st.info("No runs yet. Click 'Run now' or Start to begin periodic checks.")
+
+# show history toggle
+if st.checkbox("Show history (last runs)"):
+    for item in st.session_state["history"][:20]:
+        st.write(f"Run: {item['time']}")
+        for r in item["results"]:
+            if "error" in r:
+                st.write(f"  {r['ticker']}: ERROR: {r['error']}")
+            else:
+                line = f"  {r['ticker']}: prior {r['prior_price']:.2f} now {r['current_price']:.2f} drop {r['drop_pct']:.2f}% pe {r['pe']}"
+                if r["alert"]:
+                    st.write(line + "  ALERT")
+                else:
+                    st.write(line)
