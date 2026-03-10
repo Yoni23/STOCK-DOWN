@@ -128,5 +128,5 @@ def evaluate_batch(tickers, hist_df, last_good):
             "ticker": tk,
             "prior_price": prior,
             "current_price": current,
-            "drop_pct": drop_pct,
+            "drop_pct": drop_pct}
            
