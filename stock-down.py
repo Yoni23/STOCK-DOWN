@@ -37,11 +37,14 @@ def get_price_7_days_ago(ticker):
     hist = tk.history(start=start.isoformat(), end=(end + dt.timedelta(days=1)).isoformat(), interval="1d")
     if hist.empty:
         return None
-    target = end - dt.timedelta(days=7)
-    dates = pd.to_datetime(hist.index.date)
-    past_dates = [d for d in dates if d <= target]
-    chosen = max(past_dates) if past_dates else dates[0]
-    price = float(hist.loc[str(chosen)]["Close"])
+    target = pd.to_datetime(end - dt.timedelta(days=7)).normalize()
+    hist_dates = pd.to_datetime(hist.index).normalize()
+    eligible = hist_dates[hist_dates <= target]
+    if eligible.empty:
+        chosen_idx = hist_dates[0]
+    else:
+        chosen_idx = eligible.max()
+    price = float(hist.loc[str(chosen_idx.date())]["Close"])
     return price
 
 def evaluate_ticker(ticker):
