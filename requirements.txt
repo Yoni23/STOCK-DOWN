@@ -2,8 +2,4 @@ streamlit
 yfinance
 pandas
 requests
-(Optional — pinned versions for stability)
-streamlit==1.25.0
-yfinance==0.2.27
-pandas==2.2.3
-requests==2.31.0
+numpy
