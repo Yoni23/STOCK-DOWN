@@ -1,0 +1,140 @@
+# watcher.py
+import time
+import datetime as dt
+import logging
+from math import isnan
+import yfinance as yf
+import pandas as pd
+import requests
+from apscheduler.schedulers.background import BackgroundScheduler
+from config import (
+    TICKERS,
+    THRESHOLD_PE_LE_25,
+    THRESHOLD_PE_GT_25_OR_NEG,
+    CHECK_INTERVAL_MINUTES,
+    ENABLE_EMAIL,
+    EMAIL_SMTP_SERVER,
+    EMAIL_SMTP_PORT,
+    EMAIL_USERNAME,
+    EMAIL_PASSWORD,
+    EMAIL_FROM,
+    EMAIL_TO,
+    ENABLE_WEBHOOK,
+    WEBHOOK_URL,
+)
+
+import smtplib
+from email.mime.text import MIMEText
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+def get_ticker_info(ticker):
+    """Return current_price (float) and trailingPE (float or None)."""
+    tk = yf.Ticker(ticker)
+    # fast current price
+    info = tk.info
+    current_price = info.get("regularMarketPrice") or info.get("previousClose")
+    pe = info.get("trailingPE")
+    # If yfinance returns nan, convert to None
+    if current_price is None:
+        # fallback to history
+        hist = tk.history(period="2d", interval="1d")
+        if not hist.empty:
+            current_price = float(hist["Close"].iloc[-1])
+    if pe is None or (isinstance(pe, float) and isnan(pe)):
+        pe = None
+    return float(current_price), pe
+
+def get_price_7_days_ago(ticker):
+    """Return close price approximately 7 calendar days ago (or the nearest prior trading day)."""
+    tk = yf.Ticker(ticker)
+    end = dt.datetime.utcnow().date()
+    start = end - dt.timedelta(days=10)  # a window to capture last trading day ~7 days ago
+    hist = tk.history(start=start.isoformat(), end=(end + dt.timedelta(days=1)).isoformat(), interval="1d")
+    if hist.empty:
+        return None
+    # target date = today - 7 days
+    target = end - dt.timedelta(days=7)
+    # find the latest available date on or before target
+    dates = pd.to_datetime(hist.index.date)
+    past_dates = [d for d in dates if d <= target]
+    if not past_dates:
+        # fallback to earliest available in window
+        chosen = dates[0]
+    else:
+        chosen = max(past_dates)
+    price = float(hist.loc[str(chosen)]["Close"])
+    return price
+
+def send_email(subject, body):
+    if not ENABLE_EMAIL:
+        return
+    msg = MIMEText(body)
+    msg["Subject"] = subject
+    msg["From"] = EMAIL_FROM
+    msg["To"] = ", ".join(EMAIL_TO)
+    with smtplib.SMTP(EMAIL_SMTP_SERVER, EMAIL_SMTP_PORT) as s:
+        s.starttls()
+        s.login(EMAIL_USERNAME, EMAIL_PASSWORD)
+        s.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
+
+def send_webhook(payload):
+    if not ENABLE_WEBHOOK:
+        return
+    try:
+        requests.post(WEBHOOK_URL, json=payload, timeout=10)
+    except Exception as e:
+        logging.exception("Webhook notification failed: %s", e)
+
+def check_ticker(ticker):
+    try:
+        current_price, pe = get_ticker_info(ticker)
+    except Exception as e:
+        logging.exception("Failed to get current price/PE for %s: %s", ticker, e)
+        return
+
+    prior_price = get_price_7_days_ago(ticker)
+    if prior_price is None:
+        logging.warning("%s: could not obtain prior price", ticker)
+        return
+
+    drop_pct = (prior_price - current_price) / prior_price * 100.0
+
+    # Determine threshold
+    if (pe is not None) and (pe <= 25):
+        threshold = THRESHOLD_PE_LE_25
+        pe_category = f"PE={pe:.2f}"
+    else:
+        threshold = THRESHOLD_PE_GT_25_OR_NEG
+        pe_category = f"PE={'None' if pe is None else f'{pe:.2f}'}"
+
+    if drop_pct >= threshold:
+        msg = (
+            f"{ticker} ALERT: price down {drop_pct:.2f}% vs 7 days ago "
+            f"(prior={prior_price:.2f}, now={current_price:.2f}), {pe_category}, threshold={threshold}%"
+        )
+        logging.info(msg)
+        # notifications
+        send_email(f"{ticker} price drop alert", msg)
+        send_webhook({"ticker": ticker, "message": msg, "drop_pct": drop_pct, "pe": pe})
+    else:
+        logging.info("%s: no alert (drop %.2f%%, threshold %s%%, %s)", ticker, drop_pct, threshold, pe_category)
+
+def run_check_all():
+    logging.info("Running check for %d tickers", len(TICKERS))
+    for t in TICKERS:
+        check_ticker(t)
+
+def main():
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(run_check_all, "interval", minutes=CHECK_INTERVAL_MINUTES, next_run_time=dt.datetime.now())
+    scheduler.start()
+    logging.info("Started scheduler: checking every %d minutes", CHECK_INTERVAL_MINUTES)
+    try:
+        while True:
+            time.sleep(60)
+    except (KeyboardInterrupt, SystemExit):
+        scheduler.shutdown()
+
+if __name__ == "__main__":
+    main()
